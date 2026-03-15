@@ -1,0 +1,13 @@
+node_modules/
+tmp/
+.env
+ffmpeg-*
+.swc
+*.mp4
+*.webm
+*.m4a
+*.mp3
+dist/
+*.7z
+*.exe
+*.part
