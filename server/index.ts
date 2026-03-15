@@ -9,9 +9,21 @@ import { exec } from 'child_process';
 import util from 'util';
 import Groq from 'groq-sdk';
 import ffmpeg from 'fluent-ffmpeg';
-import ytDlp from 'yt-dlp-exec';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
-const execPromise = util.promisify(exec);
+const execFileAsync = promisify(execFile);
+
+// Path to bundled yt-dlp.exe binary
+const ytDlpBin = path.join(process.cwd(), 'node_modules', 'yt-dlp-exec', 'bin', 'yt-dlp.exe');
+
+// Helper: run yt-dlp with explicit CLI args (bypasses yt-dlp-exec wrapper bugs)
+async function runYtDlp(args: string[]): Promise<string> {
+  const { stdout, stderr } = await execFileAsync(ytDlpBin, args, { maxBuffer: 1024 * 1024 * 100 });
+  return stdout;
+}
+
+
 
 // ES Modules fix for __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -23,7 +35,7 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 // Use the custom extracted ffmpeg binary
-const customFfmpegPath = path.join(__dirname, '..', 'ffmpeg-2026-03-12-git-f9ebdb7680-essentials_build', 'bin', 'ffmpeg.exe');
+const customFfmpegPath = path.join(__dirname, '..', 'ffmpeg-2026-03-12-git-9dc44b43b2-essentials_build', 'ffmpeg-2026-03-12-git-9dc44b43b2-essentials_build', 'bin', 'ffmpeg.exe');
 if (fs.existsSync(customFfmpegPath)) {
   console.log(`[Init] Using custom FFmpeg at: ${customFfmpegPath}`);
   ffmpeg.setFfmpegPath(customFfmpegPath);
@@ -74,12 +86,14 @@ app.post('/api/download', async (req, res) => {
 
   try {
     // Downloads best quality (video+audio) and merges into mp4
-    await ytDlp(validUrl, {
-      output: outputPath,
-      format: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-      mergeOutputFormat: 'mp4',
-      ffmpegLocation: customFfmpegPath,
-    });
+    await runYtDlp([
+      validUrl,
+      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      '--merge-output-format', 'mp4',
+      '--ffmpeg-location', customFfmpegPath,
+      '-o', outputPath,
+      '--no-playlist',
+    ]);
 
     console.log(`[Downloader] Download complete: ${outputPath}`);
 
@@ -115,14 +129,16 @@ app.post('/api/trim', async (req, res) => {
     // e.g. *10:15-15:00
     const timeRange = `*${startTime}-${endTime}`;
 
-    await ytDlp(validUrl, {
-      output: outputPath,
-      format: 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-      mergeOutputFormat: 'mp4',
-      downloadSections: timeRange,
-      forceKeyFramesAtCuts: true,
-      ffmpegLocation: customFfmpegPath,
-    });
+    await runYtDlp([
+      validUrl,
+      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      '--merge-output-format', 'mp4',
+      '--download-sections', timeRange,
+      '--force-keyframes-at-cuts',
+      '--ffmpeg-location', customFfmpegPath,
+      '-o', outputPath,
+      '--no-playlist',
+    ]);
 
     console.log(`[Trimmer] Trim download complete: ${outputPath}`);
 
@@ -160,24 +176,36 @@ app.get('/api/process-clips', async (req, res) => {
   }
 
   const jobId = Date.now().toString();
-  const videoPath = path.join(tmpDir, `source_${jobId}.mp4`);
+  const rawAudioPath = path.join(tmpDir, `raw_audio_${jobId}.m4a`);
   const audioPath = path.join(tmpDir, `audio_${jobId}.mp3`);
 
   console.log(`[AI Clips] Starting processing for: ${validUrl}`);
   sendEvent('progress', { step: 'Initializing', details: 'Preparing download environment...' });
 
   try {
-    // Step 1: Download ONLY audio (fastest, lowest impact on disk/network for 4hr+ streams)
-    console.log(`[AI Clips] Downloading audio stream only...`);
-    sendEvent('progress', { step: 'Fetching Audio', details: 'Downloading audio stream directly (skipping video)...' });
+    // Step 1: Download ONLY the raw audio stream (m4a). Avoid --extract-audio + --download-sections bug.
+    console.log(`[AI Clips] Downloading raw audio stream...`);
+    sendEvent('progress', { step: 'Fetching Audio', details: 'Downloading audio stream (first ~3 min) from source...' });
     
-    await ytDlp(validUrl, {
-      output: audioPath,
-      format: 'worstaudio[ext=m4a]/bestaudio',
-      extractAudio: true,
-      audioFormat: 'mp3',
-      downloadSections: '*00:00:00-00:03:00', // Only process first 3 mins for speed
-      ffmpegLocation: customFfmpegPath,
+    await runYtDlp([
+      validUrl,
+      '-f', 'worstaudio[ext=m4a]/bestaudio[ext=m4a]/worstaudio/bestaudio',
+      '--ffmpeg-location', customFfmpegPath,
+      '-o', rawAudioPath,
+      '--no-playlist',
+    ]);
+
+    // Step 1b: Use ffmpeg to trim to first 3 minutes and convert to mp3
+    sendEvent('progress', { step: 'Processing Audio', details: 'Trimming and converting to MP3 for transcription...' });
+    await new Promise((resolve, reject) => {
+      ffmpeg(rawAudioPath)
+        .setStartTime(0)
+        .setDuration(180) // 3 minutes
+        .audioCodec('libmp3lame')
+        .output(audioPath)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
     });
 
     // Step 2: Fast Transcription with Groq (Whisper Large V3)
@@ -228,7 +256,7 @@ app.get('/api/process-clips', async (req, res) => {
     if (aiContent) {
       try {
         const parsed = JSON.parse(aiContent);
-        hooks = Array.isArray(parsed) ? parsed : Object.values(parsed)[0];
+        hooks = (Array.isArray(parsed) ? parsed : Object.values(parsed)[0]) as any[];
       } catch(e) {
         console.error("Format error:", e);
       }
@@ -249,6 +277,7 @@ app.get('/api/process-clips', async (req, res) => {
 
     // Cleanup background files
     setTimeout(() => {
+      fs.unlink(rawAudioPath, () => {});
       fs.unlink(audioPath, () => {});
     }, 5000);
 
