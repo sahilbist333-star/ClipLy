@@ -125,22 +125,41 @@ app.post('/api/trim', async (req, res) => {
   console.log(`[Trimmer] Starting trim for: ${validUrl} from ${startTime} to ${endTime}`);
 
   try {
-    // yt-dlp allows avoiding a full download by using --download-sections
-    // e.g. *10:15-15:00
     const timeRange = `*${startTime}-${endTime}`;
+    const rawClipPath = path.join(tmpDir, `raw_clip_${Date.now()}.mp4`);
 
+    // Step 1: Download the segment
     await runYtDlp([
       validUrl,
-      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+      '-f', 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
       '--merge-output-format', 'mp4',
       '--download-sections', timeRange,
       '--force-keyframes-at-cuts',
       '--ffmpeg-location', customFfmpegPath,
-      '-o', outputPath,
+      '-o', rawClipPath,
       '--no-playlist',
     ]);
 
-    console.log(`[Trimmer] Trim download complete: ${outputPath}`);
+    // Step 2: ffmpeg center-crop to 9:16 portrait (1080x1920)
+    console.log(`[Trimmer] Cropping to 9:16...`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(rawClipPath)
+        .videoFilter([
+          'crop=ih*9/16:ih',   // center crop to 9:16 ratio
+          'scale=1080:1920',   // scale to 1080p portrait
+        ])
+        .audioCodec('aac')
+        .videoCodec('libx264')
+        .outputOptions(['-preset', 'fast', '-crf', '23'])
+        .output(outputPath)
+        .on('end', resolve)
+        .on('error', reject)
+        .run();
+    });
+
+    // Cleanup raw clip
+    fs.unlink(rawClipPath, () => {});
+    console.log(`[Trimmer] 9:16 crop complete: ${outputPath}`);
 
     res.download(outputPath, 'TrimmedVideo.mp4', (err) => {
       if (err) console.error(err);
@@ -183,107 +202,151 @@ app.get('/api/process-clips', async (req, res) => {
   sendEvent('progress', { step: 'Initializing', details: 'Preparing download environment...' });
 
   try {
-    // Step 1: Download ONLY the raw audio stream (m4a). Avoid --extract-audio + --download-sections bug.
-    console.log(`[AI Clips] Downloading raw audio stream...`);
-    sendEvent('progress', { step: 'Fetching Audio', details: 'Downloading audio stream (first ~3 min) from source...' });
-    
-    await runYtDlp([
-      validUrl,
-      '-f', 'worstaudio[ext=m4a]/bestaudio[ext=m4a]/worstaudio/bestaudio',
-      '--ffmpeg-location', customFfmpegPath,
-      '-o', rawAudioPath,
-      '--no-playlist',
-    ]);
+    // Step 1: Get video duration first
+    console.log(`[AI Clips] Getting video info...`);
+    const infoRaw = await runYtDlp([
+      validUrl, '--print', 'duration', '--no-playlist', '--no-download',
+    ]).catch(() => '600');
+    const totalDuration = parseInt((infoRaw || '600').trim()) || 600;
+    console.log(`[AI Clips] Video duration: ${totalDuration}s`);
 
-    // Step 1b: Use ffmpeg to trim to first 3 minutes and convert to mp3
-    sendEvent('progress', { step: 'Processing Audio', details: 'Trimming and converting to MP3 for transcription...' });
-    await new Promise((resolve, reject) => {
-      ffmpeg(rawAudioPath)
-        .setStartTime(0)
-        .setDuration(180) // 3 minutes
-        .audioCodec('libmp3lame')
-        .output(audioPath)
-        .on('end', resolve)
-        .on('error', reject)
-        .run();
-    });
+    // Sample audio from 3 spread positions: 10%, 40%, 70% of the video
+    // This ensures we don't just analyze the intro of a 4.5-hour stream
+    const samplePoints = totalDuration > 600
+      ? [
+          Math.floor(totalDuration * 0.10),
+          Math.floor(totalDuration * 0.40),
+          Math.floor(totalDuration * 0.70),
+        ]
+      : [0]; // For short videos, just start from beginning
 
-    // Step 2: Fast Transcription with Groq (Whisper Large V3)
-    console.log(`[AI Clips] Transcribing audio with Groq...`);
-    sendEvent('progress', { step: 'Transcribing', details: 'Running Whisper Large V3 on Groq...' });
-    
-    const transcription = await groq.audio.transcriptions.create({
-      file: fs.createReadStream(audioPath),
-      model: 'whisper-large-v3',
-      response_format: 'verbose_json',
-    });
+    const allTranscripts: string[] = [];
+    for (const startSec of samplePoints) {
+      const samplePath = path.join(tmpDir, `sample_${jobId}_${startSec}.m4a`);
+      try {
+        sendEvent('progress', { step: 'Fetching Audio', details: `Sampling audio at ${Math.floor(startSec/60)} min mark...` });
+        await runYtDlp([
+          validUrl,
+          '-f', 'worstaudio[ext=m4a]/bestaudio[ext=m4a]/worstaudio/bestaudio',
+          '--ffmpeg-location', customFfmpegPath,
+          '--download-sections', `*${startSec}-${startSec + 60}`,
+          '-o', samplePath,
+          '--no-playlist',
+        ]);
+        // Quick transcription of this sample
+        const t = await groq.audio.transcriptions.create({
+          file: fs.createReadStream(samplePath),
+          model: 'whisper-large-v3',
+          response_format: 'text' as any,
+        });
+        allTranscripts.push(`[At ${Math.floor(startSec/60)} min] ${t}`);
+        fs.unlink(samplePath, () => {});
+      } catch(e) {
+        console.warn(`[AI Clips] Sample at ${startSec}s failed, skipping`);
+      }
+    }
 
-    const fullText = transcription.text;
+    const combinedTranscript = allTranscripts.join('\n\n');
+    console.log(`[AI Clips] Got ${allTranscripts.length} transcript samples`);
 
     // Step 4: Analyze transcript with Llama-3 to find viral hooks
     console.log(`[AI Clips] Analyzing with Llama 3 to find hooks...`);
-    sendEvent('progress', { step: 'AI Analysis', details: 'Llama 3 is analyzing the transcript for viral hooks...' });
+    sendEvent('progress', { step: 'AI Analysis', details: 'Llama 3 is finding the most viral moments in the stream...' });
     
     const prompt = `
-      You are an expert short-form video editor (like TikTok/Reels).
-      Read the following transcript and find the top 3 most engaging "viral hooks" or moments.
-      Each moment should be between 15 and 60 seconds of context.
-      
-      Respond in raw JSON format as an array of objects:
-      [
-        {
-          "title": "A catchy title for the clip",
-          "explanation": "Why this goes viral",
-          "score": 99,
-          "quote_start": "The exact first few words of the clip from the text",
-          "quote_end": "The exact last few words of the clip from the text"
-        }
-      ]
+      You are an expert short-form video editor specializing in viral Twitch/YouTube clips.
+      Below are transcript samples taken from DIFFERENT POINTS in a long stream/video.
+      Each sample is labelled with [At X min] showing where in the video it was taken from.
 
-      Transcript:
-      ${fullText}
+      Find the TOP 3 most engaging viral moments. IMPORTANT: each clip MUST come from a DIFFERENT sample (different time point).
+      Look for: surprising reveals, emotional moments, funny reactions, hot takes, or memorable quotes.
+
+      You MUST return valid JSON in exactly this format:
+      {
+        "clips": [
+          {
+            "title": "Short catchy title",
+            "explanation": "Why this clip goes viral",
+            "score": 95,
+            "quote_start": "First few words of the moment",
+            "approx_minute": 42
+          }
+        ]
+      }
+
+      The "approx_minute" field must be the EXACT minute number shown in the [At X min] label for that sample.
+      Each clip must have a DIFFERENT approx_minute value.
+
+      Transcript Samples:
+      ${combinedTranscript}
     `;
 
     const chatCompletion = await groq.chat.completions.create({
       messages: [{ role: 'user', content: prompt }],
-      model: 'llama3-70b-8192',
+      model: 'llama-3.3-70b-versatile',
       temperature: 0.2,
       response_format: { type: 'json_object' }
     });
 
     const aiContent = chatCompletion.choices[0]?.message?.content;
-    let hooks = [];
+    let hooks: any[] = [];
     if (aiContent) {
       try {
         const parsed = JSON.parse(aiContent);
-        hooks = (Array.isArray(parsed) ? parsed : Object.values(parsed)[0]) as any[];
+        if (Array.isArray(parsed)) {
+          hooks = parsed;
+        } else {
+          const firstArray = Object.values(parsed).find(v => Array.isArray(v));
+          hooks = (firstArray as any[]) || [];
+        }
       } catch(e) {
-        console.error("Format error:", e);
+        console.error('[AI Clips] JSON parse error:', e);
       }
     }
 
-    console.log(`[AI Clips] Found ${hooks.length} potential clips.`);
-    sendEvent('progress', { step: 'Finalizing', details: 'Wrapping up extracted clips...' });
+    // Map each hook to timestamps based on approx_minute from AI
+    const hooksWithTimestamps = hooks.map((hook: any) => {
+      const approxMin = hook.approx_minute || 0;
+      const startSec = Math.max(0, approxMin * 60);
+      const endSec = startSec + 45;
+
+      const toHMS = (s: number) => {
+        const h = Math.floor(s / 3600).toString().padStart(2, '0');
+        const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
+        const sec = Math.floor(s % 60).toString().padStart(2, '0');
+        return `${h}:${m}:${sec}`;
+      };
+
+      return {
+        ...hook,
+        startTime: toHMS(startSec),
+        endTime: toHMS(endSec),
+        duration: '0:45',
+      };
+    });
+
+    console.log(`[AI Clips] Found ${hooksWithTimestamps.length} potential clips.`);
 
     // Send the final successful response!
     sendEvent('complete', {
       success: true,
       message: 'Video successfully analyzed',
-      clips: hooks,
-      transcript_preview: fullText.substring(0, 200) + '...'
+      clips: hooksWithTimestamps,
+      transcript_preview: combinedTranscript.substring(0, 200) + '...'
     });
 
     res.end(); // close connection
 
-    // Cleanup background files
+    // Cleanup: sample files are already deleted inline above    
     setTimeout(() => {
       fs.unlink(rawAudioPath, () => {});
       fs.unlink(audioPath, () => {});
-    }, 5000);
+    }, 1000);
 
   } catch (error: any) {
-    console.error('[AI Clips] Error:', error);
-    sendEvent('error', { message: 'Pipeline failed.', details: error.message });
+    console.error('[AI Clips] Pipeline Error:', error?.message || error);
+    console.error('[AI Clips] Error details:', error?.stderr || error?.stack || '');
+    sendEvent('error', { message: 'Pipeline failed.', details: error?.message || 'Unknown error' });
     res.end();
   }
 });

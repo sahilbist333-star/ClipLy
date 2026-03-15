@@ -8,6 +8,7 @@ export function Dashboard() {
   const [clips, setClips] = useState<any[]>([]);
   const [progressStep, setProgressStep] = useState('');
   const [progressDetails, setProgressDetails] = useState('');
+  const [downloadingId, setDownloadingId] = useState<number | null>(null);
 
   // Extract YouTube ID from various URL formats
   const extractVideoId = (url: string) => {
@@ -47,10 +48,13 @@ export function Dashboard() {
       const formattedClips = data.clips.map((clip: any, index: number) => ({
         id: index,
         title: clip.title || 'Viral Hook',
-        score: clip.score || 90 + Math.floor(Math.random() * 10),
-        duration: clip.duration || '0:30',
-        img: 'https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?auto=format&fit=crop&q=80&w=400&h=711',
-        explanation: clip.explanation
+        score: clip.score || 90,
+        duration: clip.duration || '0:45',
+        explanation: clip.explanation,
+        startTime: clip.startTime || '00:00:00',
+        endTime: clip.endTime || '00:00:45',
+        videoUrl: url,
+        videoId: videoId,
       }));
       
       setClips(formattedClips);
@@ -189,7 +193,17 @@ export function Dashboard() {
             {clips.map(clip => (
               <div key={clip.id} className="glass-panel" style={{ overflow: 'hidden', padding: 0, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ position: 'relative', aspectRatio: '9/16', background: '#000', overflow: 'hidden' }}>
-                  <img src={clip.img} alt={clip.title} style={{ width: '100%', height: '100%', objectFit: 'cover', opacity: 0.8 }} />
+                  <img 
+                    src={clip.videoId 
+                      ? `https://img.youtube.com/vi/${clip.videoId}/maxresdefault.jpg`
+                      : 'https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?auto=format&fit=crop&q=80&w=400&h=711'
+                    }
+                    alt={clip.title} 
+                    style={{ width: '100%', height: '100%', objectFit: 'cover', opacity: 0.85 }}
+                    onError={(e) => {
+                      (e.target as HTMLImageElement).src = 'https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?auto=format&fit=crop&q=80&w=400&h=711';
+                    }}
+                  />
                   <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                     <div style={{ background: 'rgba(0,0,0,0.5)', borderRadius: '50%', width: '48px', height: '48px', display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(4px)', cursor: 'pointer', transition: 'transform 0.2s', border: '1px solid rgba(255,255,255,0.2)' }}
                       onMouseEnter={(e) => e.currentTarget.style.transform = 'scale(1.1)'}
@@ -210,8 +224,37 @@ export function Dashboard() {
                     {clip.explanation}
                   </p>
                   <div style={{ display: 'flex', gap: '0.5rem' }}>
-                    <button className="btn btn-primary" style={{ flex: 1, padding: '0.5rem' }}>
-                      <Download size={18} /> Download
+                    <button 
+                      className="btn btn-primary" 
+                      style={{ flex: 1, padding: '0.5rem' }}
+                      disabled={downloadingId === clip.id}
+                      onClick={async () => {
+                        try {
+                          setDownloadingId(clip.id);
+                          const response = await fetch('http://localhost:3001/api/trim', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ url: clip.videoUrl, startTime: clip.startTime, endTime: clip.endTime }),
+                          });
+                          if (response.ok) {
+                            const blob = await response.blob();
+                            const a = document.createElement('a');
+                            a.href = URL.createObjectURL(blob);
+                            a.download = `${clip.title.replace(/[^a-z0-9]/gi, '_')}.mp4`;
+                            document.body.appendChild(a);
+                            a.click();
+                            a.remove();
+                          } else {
+                            alert('Download failed.');
+                          }
+                        } catch (err) { alert('Network error.'); }
+                        finally { setDownloadingId(null); }
+                      }}
+                    >
+                      {downloadingId === clip.id 
+                        ? <><Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} /> Downloading...</>
+                        : <><Download size={18} /> Download Clip</>
+                      }
                     </button>
                   </div>
                 </div>
